@@ -1,0 +1,852 @@
+-- ============================================================
+-- CITYRIDE BIKE RENTAL DATA PIPELINE
+-- ============================================================
+-- Architecture: Bronze (Raw) → Silver (Cleaned) → Gold (Analytics)
+-- Features: SCD Type-2, Streams/Tasks, Masking, Row Access Control
+-- ============================================================
+
+-- ============================================================
+-- SECTION 1: DATABASE & WAREHOUSE SETUP
+-- ============================================================
+
+-- Create main database for the bike rental platform
+CREATE OR REPLACE DATABASE CITYRIDE_DB;
+USE DATABASE CITYRIDE_DB;
+
+-- Create medallion architecture schemas
+-- BRONZE: Raw data as-is from source (all STRING types)
+-- SILVER: Cleaned, validated, typed data
+-- GOLD: Aggregated KPIs and analytics tables
+CREATE OR REPLACE SCHEMA BRONZE;
+CREATE OR REPLACE SCHEMA SILVER;
+CREATE OR REPLACE SCHEMA GOLD;
+
+-- Create compute warehouse (auto-suspend after 60s idle)
+CREATE OR REPLACE WAREHOUSE CITY_WH
+WITH WAREHOUSE_SIZE = 'XSMALL'
+AUTO_SUSPEND = 60
+AUTO_RESUME = TRUE;
+
+USE WAREHOUSE CITY_WH;
+
+-- ============================================================
+-- SECTION 2: EXTERNAL STAGE & S3 INTEGRATION
+-- ============================================================
+
+-- Storage integration to securely access AWS S3 bucket
+-- Note: Requires trust policy configured in AWS IAM role
+CREATE OR REPLACE STORAGE INTEGRATION cityride_s3_int
+TYPE = EXTERNAL_STAGE
+STORAGE_PROVIDER = S3
+ENABLED = TRUE
+STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::545224915349:role/Mounika-1001'
+STORAGE_ALLOWED_LOCATIONS = ('s3://snowflake-practice-bucket-02');
+
+-- Get IAM user ARN and external ID for AWS trust policy setup
+DESC INTEGRATION cityride_s3_int;
+
+-- External stage pointing to S3 bucket with CSV file format
+CREATE OR REPLACE STAGE cityride_stage
+URL = 's3://snowflake-practice-bucket-02/Bike_Rental/'
+STORAGE_INTEGRATION = cityride_s3_int
+FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY='"' SKIP_HEADER=1);
+
+-- ============================================================
+-- SECTION 3: BRONZE LAYER - RAW DATA TABLES
+-- ============================================================
+-- All columns as STRING to preserve raw data exactly as received
+
+-- Bikes master data: bike inventory with status and maintenance info
+CREATE OR REPLACE TABLE BRONZE.bikes_raw (
+    bike_id STRING,
+    bike_type STRING,           -- 'classic' or 'e-bike'
+    status STRING,              -- 'available', 'in_use', 'maintenance'
+    purchase_date STRING,
+    last_service_date STRING,
+    odometer_km STRING,
+    battery_level STRING,       -- 0-100 for e-bikes
+    firmware_version STRING
+);
+
+-- Initial bulk load from master CSV file
+COPY INTO BRONZE.bikes_raw
+FROM @cityride_stage/bikes_master.csv;
+
+-- Rentals transaction data: each bike rental event
+CREATE OR REPLACE TABLE BRONZE.rentals_raw (
+    rental_id STRING,
+    user_id STRING,
+    bike_id STRING,
+    start_station_id STRING,
+    end_station_id STRING,
+    start_time STRING,
+    end_time STRING,
+    duration_sec STRING,
+    distance_km STRING,
+    price STRING,
+    plan_type STRING,           -- 'payday_pass', 'monthly', 'annual'
+    channel STRING,             -- 'app', 'kiosk'
+    device_info STRING,
+    start_gps STRING,           -- 'lat,long' format
+    end_gps STRING,
+    is_flagged STRING           -- Flagged for review
+);
+
+COPY INTO BRONZE.rentals_raw
+FROM @cityride_stage/rentals_master.csv;
+
+-- Stations master data: docking station locations
+CREATE OR REPLACE TABLE BRONZE.stations_raw (
+    station_id STRING,
+    station_name STRING,
+    latitude STRING,
+    longitude STRING,
+    capacity STRING,            -- Number of docks
+    neighborhood STRING,
+    city_zone STRING,           -- Zone for row-level access control
+    install_date STRING,
+    status STRING               -- 'active', 'inactive', 'maintenance'
+);
+
+COPY INTO BRONZE.stations_raw
+FROM @cityride_stage/stations_master.csv;
+
+-- Riders (users) master data: customer information
+CREATE OR REPLACE TABLE BRONZE.riders_raw (
+    user_id STRING,
+    customer_name STRING,
+    dob STRING,
+    gender STRING,
+    email STRING,               -- PII - will be masked
+    phone STRING,               -- PII - will be masked
+    address STRING,
+    city STRING,
+    state STRING,
+    region STRING,              -- Used for row-level access control
+    kyc_status STRING,          -- 'Verified', 'Pending'
+    registration_date STRING,
+    is_student STRING,
+    corporate_id STRING
+);
+
+COPY INTO BRONZE.riders_raw
+FROM @cityride_stage/users_master.csv;
+
+-- ============================================================
+-- SECTION 4: SNOWPIPES - CONTINUOUS DATA INGESTION
+-- ============================================================
+-- Auto-ingest pipes for incremental data files (requires SQS notification)
+
+-- Bikes incremental pipe (FIXED)
+CREATE OR REPLACE PIPE bikes_pipe
+AUTO_INGEST = TRUE
+AS
+COPY INTO BRONZE.bikes_raw
+FROM @cityride_stage
+PATTERN = '.*bikes_inc.*\\.csv'
+FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY='"' SKIP_HEADER=1)
+ON_ERROR = 'CONTINUE';
+
+-- Rentals incremental pipe (FIXED)
+CREATE OR REPLACE PIPE rentals_pipe
+AUTO_INGEST = TRUE
+AS
+COPY INTO BRONZE.rentals_raw
+FROM @cityride_stage
+PATTERN = '.*rentals_inc.*\\.csv'
+FILE_FORMAT = (TYPE = CSV SKIP_HEADER=1);
+
+-- Stations incremental pipe (FIXED)
+CREATE OR REPLACE PIPE stations_pipe
+AUTO_INGEST = TRUE
+AS
+COPY INTO BRONZE.stations_raw
+FROM @cityride_stage
+PATTERN = '.*stations_inc.*\\.csv'
+FILE_FORMAT = (TYPE = CSV SKIP_HEADER=1);
+
+-- Riders incremental pipe (FIXED)
+CREATE OR REPLACE PIPE riders_pipe
+AUTO_INGEST = TRUE
+AS
+COPY INTO BRONZE.riders_raw
+FROM @cityride_stage
+PATTERN = '.*users_inc.*\\.csv'
+FILE_FORMAT = (TYPE = CSV SKIP_HEADER=1);
+
+-- ============================================================
+-- SECTION 5: STREAMS - CHANGE DATA CAPTURE
+-- ============================================================
+-- Streams track inserts/updates/deletes on bronze tables for incremental processing
+
+-- Stream on riders for SCD Type-2 processing
+CREATE OR REPLACE STREAM riders_stream
+ON TABLE BRONZE.riders_raw
+APPEND_ONLY = TRUE;
+
+-- Stream on bikes for incremental updates
+CREATE OR REPLACE STREAM bikes_stream
+ON TABLE BRONZE.bikes_raw
+APPEND_ONLY = TRUE;
+
+-- Stream on stations for incremental updates
+CREATE OR REPLACE STREAM stations_stream
+ON TABLE BRONZE.stations_raw
+APPEND_ONLY = TRUE;
+
+-- Stream on rentals for incremental processing
+CREATE OR REPLACE STREAM rentals_stream
+ON TABLE BRONZE.rentals_raw
+APPEND_ONLY = TRUE;
+
+-- ============================================================
+-- SECTION 6: TASKS - AUTOMATED INCREMENTAL PROCESSING
+-- ============================================================
+
+-- Task 1: SCD Type-2 processing for riders dimension
+-- Tracks historical changes by closing old records and inserting new versions
+CREATE OR REPLACE TASK task_riders_scd2
+WAREHOUSE = CITY_WH
+SCHEDULE = '5 MINUTE'
+WHEN SYSTEM$STREAM_HAS_DATA('riders_stream')
+AS
+MERGE INTO SILVER.riders_silver tgt
+USING (
+    SELECT DISTINCT user_id, customer_name, email, city, kyc_status
+    FROM riders_stream
+) src
+ON tgt.user_id = src.user_id AND tgt.is_current = TRUE
+-- When attributes change, close the current record
+WHEN MATCHED AND (
+    tgt.customer_name <> src.customer_name OR
+    tgt.email <> src.email OR
+    tgt.city <> src.city
+)
+THEN UPDATE SET 
+    valid_to = CURRENT_TIMESTAMP(),
+    is_current = FALSE
+-- Insert new records
+WHEN NOT MATCHED THEN
+INSERT (
+    user_id, customer_name, email, city,
+    valid_from, valid_to, is_current
+)
+VALUES (
+    src.user_id, src.customer_name, src.email, src.city,
+    CURRENT_TIMESTAMP(), NULL, TRUE
+);
+
+-- Task 2: Incremental rentals processing from stream to silver
+CREATE OR REPLACE TASK task_rentals_silver
+WAREHOUSE = CITY_WH
+SCHEDULE = '5 MINUTE'
+WHEN SYSTEM$STREAM_HAS_DATA('rentals_stream')
+AS
+INSERT INTO SILVER.rentals_silver
+SELECT
+    rental_id,
+    user_id,
+    bike_id,
+    start_station_id,
+    end_station_id,
+    TO_TIMESTAMP(start_time),
+    TO_TIMESTAMP(end_time),
+    TRY_TO_NUMBER(duration_sec),
+    TRY_TO_NUMBER(distance_km),
+    TRY_TO_NUMBER(price),
+    plan_type,
+    channel,
+    device_info,
+    start_gps,
+    end_gps,
+    is_flagged,
+    DATEDIFF('minute', TO_TIMESTAMP(start_time), TO_TIMESTAMP(end_time)),
+    DATE_PART(hour, TO_TIMESTAMP(start_time)),
+    'VALID'
+FROM rentals_stream;
+
+
+CREATE OR REPLACE PROCEDURE SILVER.run_all_rules()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    CALL SILVER.detect_anomalies();
+    CALL SILVER.calculate_rental_risk_scores();
+    RETURN 'All rules executed';
+END;
+$$;
+
+-- ============================================================
+-- SECTION 7: STORED PROCEDURES - ANOMALY DETECTION
+-- ============================================================
+
+-- Table to store detected anomalies with risk scores
+CREATE OR REPLACE TABLE SILVER.rental_anomalies (
+    rental_id STRING,
+    anomaly_type STRING,        -- Type of anomaly detected
+    risk_score NUMBER,          -- Risk weight (higher = more suspicious)
+    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Procedure: Detect various anomaly patterns in rental data
+-- Anomaly Types:
+--   SHORT_TRIP (30 pts): Trips under 60 seconds
+--   UNREALISTIC_SPEED (50 pts): Speed over 50 km/h
+CREATE OR REPLACE PROCEDURE SILVER.detect_anomalies()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    -- Clear previous anomaly records
+    TRUNCATE TABLE SILVER.rental_anomalies;
+    
+    -- Rule 1: Very short trips (< 60 seconds) - potential misuse
+    INSERT INTO SILVER.rental_anomalies (rental_id, anomaly_type, risk_score)
+    SELECT rental_id, 'SHORT_TRIP', 30
+    FROM SILVER.rentals_silver
+    WHERE duration_sec < 60 AND duration_sec > 0;
+    
+    -- Rule 2: Unrealistic speed (> 50 km/h) - data quality issue or fraud
+    INSERT INTO SILVER.rental_anomalies (rental_id, anomaly_type, risk_score)
+    SELECT rental_id, 'UNREALISTIC_SPEED', 50
+    FROM SILVER.rentals_silver
+    WHERE duration_sec > 0 AND (distance_km / (duration_sec / 3600.0)) > 50;
+    
+    RETURN 'Anomaly detection completed';
+END;
+$$;
+
+-- Procedure: Calculate cumulative risk scores per rental
+-- Risk Levels: HIGH (>=100), MEDIUM (>=50), LOW (>0), NONE (0)
+CREATE OR REPLACE PROCEDURE SILVER.calculate_rental_risk_scores()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    CREATE OR REPLACE TABLE GOLD.rental_risk_scores AS
+    SELECT 
+        r.rental_id,
+        r.user_id,
+        r.bike_id,
+        COALESCE(SUM(a.risk_score), 0) AS total_risk_score,
+        CASE 
+            WHEN COALESCE(SUM(a.risk_score), 0) >= 100 THEN 'HIGH'
+            WHEN COALESCE(SUM(a.risk_score), 0) >= 50 THEN 'MEDIUM'
+            WHEN COALESCE(SUM(a.risk_score), 0) > 0 THEN 'LOW'
+            ELSE 'NONE'
+        END AS risk_level
+    FROM SILVER.rentals_silver r
+    LEFT JOIN SILVER.rental_anomalies a ON r.rental_id = a.rental_id
+    GROUP BY r.rental_id, r.user_id, r.bike_id;
+    
+    RETURN 'Risk scores calculated';
+END;
+$$;
+
+-- Task 3: Run business rules after rentals are processed (DAG dependency)
+CREATE OR REPLACE TASK task_business_rules
+WAREHOUSE = CITY_WH
+AFTER task_rentals_silver
+AS
+CALL SILVER.run_all_rules();
+
+-- ============================================================
+-- SECTION 8: ENABLE TASKS & VALIDATE EXECUTION
+-- ============================================================
+
+-- Step 1: Resume tasks (child tasks first, then parent tasks)
+-- Note: Tasks must be resumed in reverse dependency order
+ALTER TASK task_rentals_silver RESUME;
+ALTER TASK task_riders_scd2 RESUME;
+ALTER TASK task_business_rules RESUME;
+
+-- Step 2: Verify tasks are now in 'started' state
+SHOW TASKS LIKE '%task%' IN DATABASE CITYRIDE_DB;
+
+-- Step 3: Check if streams have data (tasks only run when streams have data)
+SELECT 'riders_stream' AS stream_name, SYSTEM$STREAM_HAS_DATA('riders_stream') AS has_data
+UNION ALL
+SELECT 'rentals_stream', SYSTEM$STREAM_HAS_DATA('rentals_stream')
+UNION ALL
+SELECT 'bikes_stream', SYSTEM$STREAM_HAS_DATA('bikes_stream')
+UNION ALL
+SELECT 'stations_stream', SYSTEM$STREAM_HAS_DATA('stations_stream');
+
+-- Step 4: Insert test data to trigger stream-based tasks
+-- This will populate the streams and trigger task execution on next schedule
+INSERT INTO CITYRIDE_DB.BRONZE.riders_raw VALUES 
+    ('TEST001', 'Test User 1', '1990-05-15', 'M', 'testuser1@email.com', '5551234567', '100 Test St', 'TestCity', 'TestState', 'East', 'Verified', '2026-03-18', '0', 'CORP_TEST');
+
+INSERT INTO CITYRIDE_DB.BRONZE.rentals_raw VALUES
+    ('RENT_TEST001', 'TEST001', '1', 'S001', 'S002', '2026-03-18 10:00:00', '2026-03-18 10:30:00', '1800', '5.5', '12.50', 'monthly', 'app', 'iPhone 15', '40.7128,-74.0060', '40.7580,-73.9855', '0');
+
+-- Step 5: Manually execute tasks for immediate testing (optional)
+-- Uncomment to run tasks immediately without waiting for schedule
+-- EXECUTE TASK CITYRIDE_DB.GOLD.task_riders_scd2;
+-- EXECUTE TASK CITYRIDE_DB.GOLD.task_rentals_silver;
+
+-- Step 6: Monitor task execution history
+-- Run this after a few minutes to see task results
+SELECT 
+    NAME AS task_name,
+    STATE AS execution_state,
+    SCHEDULED_TIME,
+    COMPLETED_TIME,
+    DATEDIFF('second', SCHEDULED_TIME, COMPLETED_TIME) AS runtime_seconds,
+    ERROR_CODE,
+    ERROR_MESSAGE,
+    RETURN_VALUE
+FROM TABLE(CITYRIDE_DB.INFORMATION_SCHEMA.TASK_HISTORY(
+    SCHEDULED_TIME_RANGE_START => DATEADD('hour', -24, CURRENT_TIMESTAMP()),
+    RESULT_LIMIT => 50
+))
+WHERE NAME IN ('TASK_RIDERS_SCD2', 'TASK_RENTALS_SILVER', 'TASK_BUSINESS_RULES')
+ORDER BY SCHEDULED_TIME DESC;
+
+-- Step 7: Summary view of task execution statistics
+SELECT 
+    NAME AS task_name,
+    COUNT(*) AS total_runs,
+    COUNT_IF(STATE = 'SUCCEEDED') AS successful_runs,
+    COUNT_IF(STATE = 'FAILED') AS failed_runs,
+    AVG(DATEDIFF('second', SCHEDULED_TIME, COMPLETED_TIME)) AS avg_runtime_sec,
+    MAX(SCHEDULED_TIME) AS last_run
+FROM TABLE(CITYRIDE_DB.INFORMATION_SCHEMA.TASK_HISTORY(
+    SCHEDULED_TIME_RANGE_START => DATEADD('day', -7, CURRENT_TIMESTAMP()),
+    RESULT_LIMIT => 100
+))
+WHERE NAME IN ('TASK_RIDERS_SCD2', 'TASK_RENTALS_SILVER', 'TASK_BUSINESS_RULES')
+GROUP BY NAME;
+
+-- Step 8: Suspend tasks if needed (for maintenance)
+-- ALTER TASK CITYRIDE_DB.GOLD.task_rentals_silver SUSPEND;
+-- ALTER TASK CITYRIDE_DB.GOLD.task_riders_scd2 SUSPEND;
+-- ALTER TASK CITYRIDE_DB.GOLD.task_business_rules SUSPEND;
+
+-- ============================================================
+-- SECTION 9: SILVER LAYER - CLEANED & TRANSFORMED DATA
+-- ============================================================
+
+-- Riders cleaned: Deduplicated, trimmed, normalized
+-- Uses ROW_NUMBER to keep only the latest record per user
+CREATE OR REPLACE TABLE SILVER.riders_cleaned AS
+SELECT 
+    USER_ID,
+    TRIM(CUSTOMER_NAME) AS customer_name,
+    TO_DATE(DOB) AS dob,
+    UPPER(TRIM(GENDER)) AS gender,
+    LOWER(TRIM(EMAIL)) AS email,        -- Normalized to lowercase
+    PHONE,
+    TRIM(ADDRESS) AS address,
+    TRIM(CITY) AS city,
+    TRIM(STATE) AS state,
+    TRIM(REGION) AS region,             -- Used for row-level access
+    UPPER(TRIM(KYC_STATUS)) AS kyc_status,
+    TO_DATE(REGISTRATION_DATE) AS registration_date,
+    TRY_TO_BOOLEAN(IS_STUDENT) AS is_student,
+    TRIM(CORPORATE_ID) AS corporate_id
+FROM (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY USER_ID ORDER BY REGISTRATION_DATE DESC) AS rn
+    FROM BRONZE.riders_raw
+    WHERE USER_ID IS NOT NULL
+      AND EMAIL IS NOT NULL
+)
+WHERE rn = 1;
+
+-- Riders SCD Type-2 dimension table structure
+CREATE OR REPLACE TABLE SILVER.riders_silver (
+    user_id STRING,
+    customer_name STRING,
+    email STRING,
+    city STRING,
+    kyc_status STRING,
+    registration_date DATE,
+    valid_from TIMESTAMP,       -- Record effective start
+    valid_to TIMESTAMP,         -- Record effective end (NULL = current)
+    is_current BOOLEAN          -- TRUE = active record
+);
+
+-- Initial load with SCD Type-2 merge logic
+MERGE INTO SILVER.riders_silver tgt
+USING (
+    SELECT DISTINCT
+        user_id,
+        customer_name,
+        email,
+        city,
+        kyc_status,
+        TO_DATE(registration_date) AS registration_date
+    FROM BRONZE.riders_raw
+) src
+ON tgt.user_id = src.user_id AND tgt.is_current = TRUE
+-- Close existing record if attributes changed
+WHEN MATCHED AND (
+    tgt.customer_name <> src.customer_name OR
+    tgt.email <> src.email OR
+    tgt.city <> src.city OR
+    tgt.kyc_status <> src.kyc_status
+)
+THEN UPDATE SET
+    valid_to = CURRENT_TIMESTAMP(),
+    is_current = FALSE
+-- Insert new record
+WHEN NOT MATCHED THEN
+INSERT (
+    user_id, customer_name, email, city, kyc_status,
+    registration_date, valid_from, valid_to, is_current
+)
+VALUES (
+    src.user_id, src.customer_name, src.email, src.city, src.kyc_status,
+    src.registration_date, CURRENT_TIMESTAMP(), NULL, TRUE
+);
+
+-- Bikes silver: Type-cast and add data quality flags
+CREATE OR REPLACE TABLE SILVER.bikes_silver AS
+SELECT DISTINCT
+    bike_id,
+    bike_type,
+    status,
+    TO_DATE(purchase_date) AS purchase_date,
+    TO_DATE(last_service_date) AS last_service_date,
+    TRY_TO_NUMBER(odometer_km) AS odometer_km,
+    TRY_TO_NUMBER(battery_level) AS battery_level,
+    firmware_version,
+    -- Data Quality Check: Battery must be 0-100
+    CASE 
+        WHEN TRY_TO_NUMBER(battery_level) BETWEEN 0 AND 100 THEN 'VALID'
+        ELSE 'INVALID'
+    END AS battery_check
+FROM BRONZE.bikes_raw;
+
+-- Stations silver: Normalized coordinates and typed columns
+CREATE OR REPLACE TABLE SILVER.stations_silver AS
+SELECT DISTINCT
+    station_id,
+    station_name,
+    ROUND(TRY_TO_DOUBLE(latitude), 5) AS latitude,
+    ROUND(TRY_TO_DOUBLE(longitude), 5) AS longitude,
+    TRY_TO_NUMBER(capacity) AS capacity,
+    neighborhood,
+    city_zone,                  -- Used for row-level access
+    TO_DATE(install_date) AS install_date,
+    status
+FROM BRONZE.stations_raw;
+
+-- Rentals silver: Full transformation with derived fields and DQ status
+CREATE OR REPLACE TABLE SILVER.rentals_silver AS
+SELECT
+    rental_id,
+    user_id,
+    bike_id,
+    start_station_id,
+    end_station_id,
+    -- Time normalization
+    TO_TIMESTAMP(start_time) AS start_time,
+    TO_TIMESTAMP(end_time) AS end_time,
+    TRY_TO_NUMBER(duration_sec) AS duration_sec,
+    TRY_TO_NUMBER(distance_km) AS distance_km,
+    TRY_TO_NUMBER(price) AS price,
+    plan_type,
+    channel,
+    device_info,
+    start_gps,                  -- GPS will be masked for non-admin
+    end_gps,
+    -- Derived fields for analytics
+    DATEDIFF('minute', TO_TIMESTAMP(start_time), TO_TIMESTAMP(end_time)) AS duration_minutes,
+    DATE_PART(hour, TO_TIMESTAMP(start_time)) AS hour,
+    DATE_PART(day, TO_TIMESTAMP(start_time)) AS day,
+    -- Data Quality Status: Valid if duration/distance are positive and times are logical
+    CASE 
+        WHEN TRY_TO_NUMBER(duration_sec) >= 0 
+         AND TRY_TO_NUMBER(distance_km) >= 0
+         AND TO_TIMESTAMP(end_time) >= TO_TIMESTAMP(start_time)
+        THEN 'VALID'
+        ELSE 'INVALID'
+    END AS dq_status
+FROM BRONZE.rentals_raw;
+
+-- Rentals validated: Only valid records with referential integrity
+CREATE OR REPLACE TABLE SILVER.rentals_validated AS
+SELECT r.*
+FROM SILVER.rentals_silver r
+JOIN SILVER.bikes_silver b ON r.bike_id = b.bike_id
+JOIN SILVER.stations_silver s1 ON r.start_station_id = s1.station_id
+JOIN SILVER.stations_silver s2 ON r.end_station_id = s2.station_id
+JOIN SILVER.riders_silver u ON r.user_id = u.user_id
+WHERE r.dq_status = 'VALID';
+
+UPDATE SILVER.rentals_silver
+SET duration_sec = 10
+WHERE rental_id IS NOT NULL;
+
+CALL SILVER.detect_anomalies();
+
+SELECT COUNT(*) FROM SILVER.rental_anomalies;
+
+-- ============================================================
+-- SECTION 10: GOLD LAYER - KPIs & ANALYTICS
+-- ============================================================
+
+-- KPI 1: Anomalous Rental Probability Score
+-- Formula: (Invalid rentals / Total rentals) * 100
+CREATE OR REPLACE TABLE GOLD.anomaly_kpi AS
+SELECT
+    ROUND(
+        COUNT(*) * 100.0 /
+        NULLIF((SELECT COUNT(*) FROM SILVER.rentals_silver), 0),
+    2) AS anomaly_percentage
+FROM SILVER.rental_anomalies;
+
+-- KPI 2: Station Availability Score
+-- Measures ride distribution across stations
+CREATE OR REPLACE TABLE GOLD.station_availability AS
+SELECT
+    start_station_id AS station_id,
+    COUNT(*) AS rides,
+    COUNT(*) * 100.0 / SUM(COUNT(*)) OVER() AS availability_score
+FROM SILVER.rentals_validated
+GROUP BY start_station_id;
+
+-- KPI 3: Active Rider Engagement Ratio
+-- % of users with at least 1 ride in last 30 days
+CREATE OR REPLACE TABLE GOLD.active_riders AS
+SELECT
+    COUNT(DISTINCT r.user_id) AS active_users,
+    (SELECT COUNT(*) FROM SILVER.riders_silver WHERE is_current = TRUE) AS total_users,
+    ROUND(COUNT(DISTINCT r.user_id) * 100.0 /
+        NULLIF((SELECT COUNT(*) FROM SILVER.riders_silver WHERE is_current = TRUE), 0), 2) AS engagement_ratio
+FROM SILVER.rentals_validated r
+WHERE r.start_time >= DATEADD(day, -30, CURRENT_TIMESTAMP());
+
+-- KPI 4: Fleet Maintenance Health Index
+-- % of bikes with valid battery (0-100 range)
+CREATE OR REPLACE TABLE GOLD.fleet_health AS
+SELECT
+    COUNT_IF(battery_check = 'VALID') * 100.0 / COUNT(*) AS health_score
+FROM SILVER.bikes_silver;
+
+-- KPI 5: Average Rental Revenue by Channel
+-- Revenue analysis by acquisition channel (app/kiosk)
+CREATE OR REPLACE TABLE GOLD.revenue_kpi AS
+SELECT
+    channel,
+    AVG(price) AS avg_revenue
+FROM SILVER.rentals_validated
+GROUP BY channel;
+
+SELECT COUNT(*) FROM SILVER.rental_anomalies;
+
+CALL SILVER.detect_anomalies();
+
+-- Verify KPI outputs
+SELECT * FROM GOLD.revenue_kpi;
+SELECT * FROM GOLD.fleet_health;
+SELECT * FROM GOLD.active_riders;
+SELECT * FROM GOLD.station_availability;
+select * from GOLD.anomaly_kpi;
+
+-- ============================================================
+-- SECTION 11: DYNAMIC DATA MASKING POLICIES
+-- ============================================================
+-- Protect PII data (email, phone, GPS) from unauthorized roles
+
+-- Email masking: Shows first 2 chars + *** + domain
+-- Full access: ACCOUNTADMIN, DATA_ADMIN
+-- Masked output: "us***@mail.com"
+CREATE OR REPLACE MASKING POLICY SILVER.mask_email AS (val STRING) RETURNS STRING ->
+    CASE 
+        WHEN CURRENT_ROLE() IN ('ACCOUNTADMIN', 'DATA_ADMIN') THEN val
+        ELSE CONCAT(LEFT(val, 2), '***@', SPLIT_PART(val, '@', 2))
+    END;
+
+-- Phone masking: Shows only last 4 digits
+-- Masked output: "***-***-1234"
+CREATE OR REPLACE MASKING POLICY SILVER.mask_phone AS (val STRING) RETURNS STRING ->
+    CASE 
+        WHEN CURRENT_ROLE() IN ('ACCOUNTADMIN', 'DATA_ADMIN') THEN val
+        ELSE CONCAT('***-***-', RIGHT(val, 4))
+    END;
+
+-- GPS masking: Completely redacted for restricted roles
+-- ANALYST role can see GPS for analytics purposes
+-- Masked output: "REDACTED"
+CREATE OR REPLACE MASKING POLICY SILVER.mask_gps AS (val STRING) RETURNS STRING ->
+    CASE 
+        WHEN CURRENT_ROLE() IN ('ACCOUNTADMIN', 'DATA_ADMIN', 'ANALYST') THEN val
+        ELSE 'REDACTED'
+    END;
+
+-- Apply masking policies to tables
+ALTER TABLE SILVER.riders_silver MODIFY COLUMN email SET MASKING POLICY SILVER.mask_email;
+ALTER TABLE SILVER.riders_cleaned MODIFY COLUMN email SET MASKING POLICY SILVER.mask_email;
+ALTER TABLE SILVER.riders_cleaned MODIFY COLUMN phone SET MASKING POLICY SILVER.mask_phone;
+ALTER TABLE SILVER.rentals_silver MODIFY COLUMN start_gps SET MASKING POLICY SILVER.mask_gps;
+ALTER TABLE SILVER.rentals_silver MODIFY COLUMN end_gps SET MASKING POLICY SILVER.mask_gps;
+
+-- ============================================================
+-- SECTION 12: ROW-LEVEL ACCESS CONTROL
+-- ============================================================
+-- Restrict data access by region/city_zone per user
+
+-- Mapping table: Define which users can access which regions
+CREATE OR REPLACE TABLE SILVER.user_access_mapping (
+    username STRING,
+    region STRING,              -- 'East', 'West', 'ALL' for full access
+    city_zone STRING,           -- 'Downtown', 'Suburban', 'ALL' for full access
+    granted_by STRING DEFAULT CURRENT_USER(),
+    granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Grant full access to admin user
+INSERT INTO SILVER.user_access_mapping (username, region, city_zone) VALUES
+    ('MOUNIKASATYA', 'ALL', 'ALL');
+
+-- Row Access Policy: Region-based filtering for riders
+-- Returns TRUE if user can access the row
+CREATE OR REPLACE ROW ACCESS POLICY SILVER.region_row_access AS (region_val STRING) RETURNS BOOLEAN ->
+    CURRENT_ROLE() IN ('ACCOUNTADMIN', 'DATA_ADMIN')
+    OR EXISTS (
+        SELECT 1 FROM SILVER.user_access_mapping 
+        WHERE username = CURRENT_USER() 
+          AND (region = region_val OR region = 'ALL')
+    );
+
+-- Row Access Policy: City zone-based filtering for rentals
+CREATE OR REPLACE ROW ACCESS POLICY SILVER.city_zone_row_access AS (city_zone_val STRING) RETURNS BOOLEAN ->
+    CURRENT_ROLE() IN ('ACCOUNTADMIN', 'DATA_ADMIN')
+    OR EXISTS (
+        SELECT 1 FROM SILVER.user_access_mapping 
+        WHERE username = CURRENT_USER() 
+          AND (city_zone = city_zone_val OR city_zone = 'ALL')
+    );
+
+-- Apply row access policy to riders_cleaned table
+ALTER TABLE SILVER.riders_cleaned ADD ROW ACCESS POLICY SILVER.region_row_access ON (region);
+
+-- Secure view for rentals with city_zone for row access policy
+CREATE OR REPLACE SECURE VIEW SILVER.rentals_with_zone AS
+SELECT 
+    r.*,
+    s.city_zone
+FROM SILVER.rentals_silver r
+LEFT JOIN SILVER.stations_silver s ON r.start_station_id = s.station_id;
+
+-- Apply row access policy to the secure view
+ALTER VIEW SILVER.rentals_with_zone ADD ROW ACCESS POLICY SILVER.city_zone_row_access ON (city_zone);
+
+-- Example: Grant regional access to another user
+-- INSERT INTO SILVER.user_access_mapping (username, region, city_zone) 
+-- VALUES ('ANALYST_USER', 'East', 'Downtown');
+
+-- ============================================================
+-- SECTION 13: AUDIT & DATA LINEAGE REPORTING
+-- ============================================================
+
+-- Comprehensive audit view: Record counts across all pipeline layers
+CREATE OR REPLACE VIEW GOLD.pipeline_audit_report AS
+SELECT 
+    '1. BRONZE' AS layer,
+    'riders_raw' AS table_name,
+    COUNT(*) AS row_count,
+    NULL AS source_table,
+    'S3 Ingestion via Snowpipe' AS load_method,
+    CURRENT_TIMESTAMP() AS audit_timestamp
+FROM BRONZE.riders_raw
+UNION ALL
+SELECT '1. BRONZE', 'bikes_raw', COUNT(*), NULL, 'S3 Ingestion via Snowpipe', CURRENT_TIMESTAMP() FROM BRONZE.bikes_raw
+UNION ALL
+SELECT '1. BRONZE', 'stations_raw', COUNT(*), NULL, 'S3 Ingestion via Snowpipe', CURRENT_TIMESTAMP() FROM BRONZE.stations_raw
+UNION ALL
+SELECT '1. BRONZE', 'rentals_raw', COUNT(*), NULL, 'S3 Ingestion via Snowpipe', CURRENT_TIMESTAMP() FROM BRONZE.rentals_raw
+UNION ALL
+SELECT '2. SILVER', 'riders_silver', COUNT(*), 'riders_raw', 'SCD Type-2 MERGE (Task)', CURRENT_TIMESTAMP() FROM SILVER.riders_silver
+UNION ALL
+SELECT '2. SILVER', 'riders_cleaned', COUNT(*), 'riders_raw', 'CTAS with Deduplication', CURRENT_TIMESTAMP() FROM SILVER.riders_cleaned
+UNION ALL
+SELECT '2. SILVER', 'bikes_silver', COUNT(*), 'bikes_raw', 'CTAS with DQ Checks', CURRENT_TIMESTAMP() FROM SILVER.bikes_silver
+UNION ALL
+SELECT '2. SILVER', 'stations_silver', COUNT(*), 'stations_raw', 'CTAS with Normalization', CURRENT_TIMESTAMP() FROM SILVER.stations_silver
+UNION ALL
+SELECT '2. SILVER', 'rentals_silver', COUNT(*), 'rentals_raw', 'CTAS with DQ Status', CURRENT_TIMESTAMP() FROM SILVER.rentals_silver
+UNION ALL
+SELECT '2. SILVER', 'rentals_validated', COUNT(*), 'rentals_silver', 'JOIN Referential Integrity', CURRENT_TIMESTAMP() FROM SILVER.rentals_validated
+UNION ALL
+SELECT '2. SILVER', 'rental_anomalies', COUNT(*), 'rentals_silver', 'Procedure: detect_anomalies()', CURRENT_TIMESTAMP() FROM SILVER.rental_anomalies
+UNION ALL
+SELECT '3. GOLD', 'rental_risk_scores', COUNT(*), 'rentals_silver + anomalies', 'Procedure: calculate_risk_scores()', CURRENT_TIMESTAMP() FROM GOLD.rental_risk_scores
+UNION ALL
+SELECT '3. GOLD', 'anomaly_kpi', COUNT(*), 'rentals_silver', 'KPI Aggregation', CURRENT_TIMESTAMP() FROM GOLD.anomaly_kpi
+UNION ALL
+SELECT '3. GOLD', 'station_availability', COUNT(*), 'rentals_validated', 'KPI Aggregation', CURRENT_TIMESTAMP() FROM GOLD.station_availability
+UNION ALL
+SELECT '3. GOLD', 'active_riders', COUNT(*), 'rentals_validated + riders', 'KPI Aggregation', CURRENT_TIMESTAMP() FROM GOLD.active_riders
+UNION ALL
+SELECT '3. GOLD', 'fleet_health', COUNT(*), 'bikes_silver', 'KPI Aggregation', CURRENT_TIMESTAMP() FROM GOLD.fleet_health
+UNION ALL
+SELECT '3. GOLD', 'revenue_kpi', COUNT(*), 'rentals_validated', 'KPI Aggregation', CURRENT_TIMESTAMP() FROM GOLD.revenue_kpi;
+
+-- Data lineage view with drop rate analysis by domain
+CREATE OR REPLACE VIEW GOLD.data_lineage_report AS
+WITH bronze_counts AS (
+    SELECT 'riders' AS domain, COUNT(*) AS cnt FROM BRONZE.riders_raw
+    UNION ALL SELECT 'bikes', COUNT(*) FROM BRONZE.bikes_raw
+    UNION ALL SELECT 'stations', COUNT(*) FROM BRONZE.stations_raw
+    UNION ALL SELECT 'rentals', COUNT(*) FROM BRONZE.rentals_raw
+),
+silver_counts AS (
+    SELECT 'riders' AS domain, COUNT(*) AS cnt FROM SILVER.riders_silver
+    UNION ALL SELECT 'bikes', COUNT(*) FROM SILVER.bikes_silver
+    UNION ALL SELECT 'stations', COUNT(*) FROM SILVER.stations_silver
+    UNION ALL SELECT 'rentals', COUNT(*) FROM SILVER.rentals_validated
+),
+gold_counts AS (
+    SELECT 'riders' AS domain, COUNT(*) AS cnt FROM GOLD.active_riders
+    UNION ALL SELECT 'bikes', COUNT(*) FROM GOLD.fleet_health
+    UNION ALL SELECT 'stations', COUNT(*) FROM GOLD.station_availability
+    UNION ALL SELECT 'rentals', COUNT(*) FROM GOLD.rental_risk_scores
+)
+SELECT 
+    b.domain,
+    b.cnt AS bronze_count,
+    s.cnt AS silver_count,
+    g.cnt AS gold_count,
+    ROUND((1 - s.cnt / NULLIF(b.cnt, 0)) * 100, 2) AS bronze_to_silver_drop_pct,
+    CASE 
+        WHEN s.cnt = b.cnt THEN 'HEALTHY'
+        WHEN s.cnt < b.cnt THEN 'DATA_LOSS'
+        ELSE 'DATA_GROWTH'
+    END AS pipeline_status
+FROM bronze_counts b
+JOIN silver_counts s ON b.domain = s.domain
+JOIN gold_counts g ON b.domain = g.domain;
+
+-- KPI dashboard summary view
+CREATE OR REPLACE VIEW GOLD.kpi_dashboard AS
+SELECT 
+    'Anomaly Rate' AS kpi_name,
+    ROUND(anomaly_percentage, 2) AS value,
+    '%' AS unit,
+    CASE WHEN anomaly_percentage < 5 THEN 'GOOD' WHEN anomaly_percentage < 15 THEN 'WARNING' ELSE 'CRITICAL' END AS status
+FROM GOLD.anomaly_kpi
+UNION ALL
+SELECT 'Fleet Health', ROUND(health_score, 2), '%', 
+    CASE WHEN health_score >= 90 THEN 'GOOD' WHEN health_score >= 70 THEN 'WARNING' ELSE 'CRITICAL' END
+FROM GOLD.fleet_health
+UNION ALL
+SELECT 'Engagement Ratio', ROUND(engagement_ratio, 2), '%',
+    CASE WHEN engagement_ratio >= 30 THEN 'GOOD' WHEN engagement_ratio >= 15 THEN 'WARNING' ELSE 'CRITICAL' END
+FROM GOLD.active_riders
+UNION ALL
+SELECT CONCAT('Avg Revenue - ', channel), ROUND(avg_revenue, 2), '$',
+    CASE WHEN avg_revenue >= 10 THEN 'GOOD' WHEN avg_revenue >= 5 THEN 'WARNING' ELSE 'CRITICAL' END
+FROM GOLD.revenue_kpi;
+
+-- Run audit reports
+SELECT * FROM GOLD.pipeline_audit_report ORDER BY layer, table_name;
+SELECT * FROM GOLD.data_lineage_report;
+SELECT * FROM GOLD.kpi_dashboard;
